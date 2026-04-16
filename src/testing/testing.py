@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from core.utils import chat_with_agent
-from attacks.attacks import adversarial_prompts, run_attacks
+from attacks.attacks import adversarial_prompts
 from agents.agent import create_unsafe_agent, create_protected_agent
 from guardrails.input_guardrails import InputGuardrailPlugin, detect_injection, topic_filter
 from guardrails.output_guardrails import OutputGuardrailPlugin, _init_judge
@@ -69,7 +69,11 @@ async def run_comparison():
     print("PHASE 1: Unprotected Agent")
     print("=" * 60)
     unsafe_agent, unsafe_runner = create_unsafe_agent()
-    unprotected_results = await run_attacks(unsafe_agent, unsafe_runner)
+    unprotected_pipeline = SecurityTestPipeline(
+        unsafe_agent, unsafe_runner, enforce_input_policy=False
+    )
+    unprotected_raw = await unprotected_pipeline.run_all(adversarial_prompts)
+    unprotected_results = _to_comparison_results(unprotected_raw)
 
     # --- Protected agent ---
     _init_judge()
@@ -81,12 +85,30 @@ async def run_comparison():
     print("\n" + "=" * 60)
     print("PHASE 2: Protected Agent")
     print("=" * 60)
-    protected_results = await run_attacks(protected_agent, protected_runner)
-
-    _annotate_block_status(unprotected_results)
-    _annotate_block_status(protected_results)
+    protected_pipeline = SecurityTestPipeline(
+        protected_agent, protected_runner, enforce_input_policy=True
+    )
+    protected_raw = await protected_pipeline.run_all(adversarial_prompts)
+    protected_results = _to_comparison_results(protected_raw)
 
     return unprotected_results, protected_results
+
+
+def _to_comparison_results(results: list["TestResult"]) -> list:
+    """Convert TestResult objects into run_attacks-like dicts for table output."""
+    converted = []
+    for result in results:
+        converted.append(
+            {
+                "id": result.attack_id,
+                "category": result.category,
+                "input": result.input_text,
+                "response": result.response,
+                "blocked": result.blocked,
+                "leaked_secrets": result.leaked_secrets,
+            }
+        )
+    return converted
 
 
 def _annotate_block_status(results: list):
@@ -163,6 +185,12 @@ class SlidingWindowRateLimiter:
         self.user_windows = defaultdict(deque)
 
     def check(self, user_id: str, now: float | None = None) -> tuple[bool, int]:
+        """Evaluate whether a user request is allowed in the current sliding window.
+
+        Returns:
+            Tuple of (allowed, retry_after_seconds). If blocked, retry_after_seconds
+            indicates the minimum wait time until the next request can pass.
+        """
         if now is None:
             now = time.time()
 
@@ -195,9 +223,10 @@ class SecurityTestPipeline:
         "db.vinbank.internal",
     ]
 
-    def __init__(self, agent, runner):
+    def __init__(self, agent, runner, enforce_input_policy: bool = True):
         self.agent = agent
         self.runner = runner
+        self.enforce_input_policy = enforce_input_policy
         self.audit_log = []
         self.rate_limit_hits = 0
         self.judge_fail_hits = 0
@@ -254,7 +283,7 @@ class SecurityTestPipeline:
         input_text = attack["input"]
 
         # Deterministic pre-check ensures suite outcomes reflect input guardrail policy.
-        if detect_injection(input_text):
+        if self.enforce_input_policy and detect_injection(input_text):
             response = "Request blocked by input guardrail: potential prompt injection detected."
             leaked = []
             blocked = True
@@ -290,7 +319,7 @@ class SecurityTestPipeline:
                 first_blocked_layer=first_layer,
             )
 
-        if topic_filter(input_text):
+        if self.enforce_input_policy and topic_filter(input_text):
             response = "Request blocked by input guardrail: outside supported banking topics or unsafe content."
             leaked = []
             blocked = True
